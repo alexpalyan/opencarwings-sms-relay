@@ -1,0 +1,16 @@
+# Compiled binaries
+/sms-relay
+/opencarwings-sms-relay
+*.tar.gz
+*.sha256
+checksums.txt
+
+# Log files
+*.log
+*.jsonl
+/cache/
+
+# OS / Editor files
+.DS_Store
+.idea/
+.vscode/
