@@ -2,7 +2,10 @@
 
 **sms-relay** is an ultra-lightweight, on-device webhook relay designed to run directly inside ARM-based Linux LTE USB modems and mobile routers (such as **ZTE MF79U**, **ZX297520V3** chipsets, and similar embedded Linux modems).
 
-It receives incoming HTTP webhooks containing raw SMS SUBMIT PDUs (e.g., from **OpenCarWings** or automotive telematics/home automation controllers) and transmits binary SMS messages over the modem's onboard AT command interface without requiring an external host PC or external modem daemons.
+It relays SMS-SUBMIT PDUs from **OpenCARWINGS** (or other automotive telematics / home-automation controllers) to the modem's onboard AT command interface — no host PC, no external modem daemons. It runs in two modes:
+
+- **`-mode ws` (default)** — an outbound WebSocket client that dials the OpenCARWINGS gateway and holds the connection open, so the modem needs **no inbound path**: no port forwarding, no tunnel, and carrier-grade NAT on the cellular side stops mattering. This is the primary mode.
+- **`-mode http` (fallback)** — an inbound HTTP webhook server, for LAN-local or tunneled setups where something in front POSTs the PDU to the modem.
 
 > [!NOTE]
 > **Platform Target**: `sms-relay` is engineered for embedded Linux-based modem environments (`GOOS=linux`). Cross-compilation for non-Linux hosts (macOS, Windows) compiles cleanly for static analysis and development, while hardware device node transport (`/dev/rpm30`) executes on Linux targets.
@@ -31,6 +34,8 @@ It receives incoming HTTP webhooks containing raw SMS SUBMIT PDUs (e.g., from **
 ---
 
 ## Architecture & Data Flow
+
+The diagram below shows the **HTTP fallback** (`-mode http`), where a controller POSTs the PDU inbound. In the default **WebSocket mode** (`-mode ws`) the arrow reverses: the relay dials **out** to the OpenCARWINGS gateway and receives PDUs over the open connection — the AT-transport half (everything below `sms-relay`) is identical.
 
 ```
 +--------------------------+       HTTP POST       +------------------------------------+
@@ -79,20 +84,39 @@ sha256sum -c --ignore-missing checksums.txt
 
 ### Build From Source
 
-To cross-compile `sms-relay` manually for ZTE ARMv7 / ARMv5 soft-float modem architecture:
+The modem's kernel breaks stock `crypto/rand` (see [`toolchain_guard.go`](toolchain_guard.go) for the full story), so the **supported build patches the Go standard library at build time** with `go build -overlay` — there is no fork of Go, and a current toolchain (Go 1.27) works:
 
 ```bash
-GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o sms-relay .
+go run ./toolchain/mkoverlay -out /tmp/ovl
+GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 \
+  go build -overlay=/tmp/ovl/overlay.json -tags patchedstdlib \
+  -trimpath -ldflags "-s -w" -o sms-relay .
+```
+
+A build guard fails loudly on Go ≥ 1.24 **without** `-tags patchedstdlib`, so you cannot accidentally ship a binary that dies on the device. As a fallback, Go 1.23.12 builds without the overlay — but only because the in-code `/dev/urandom` workaround bypasses the broken stock `crypto/rand` (which on 1.23 returns success while silently corrupting memory); 1.23 itself is still affected, and out of support:
+
+```bash
+GOTOOLCHAIN=go1.23.12 GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 \
+  go build -trimpath -ldflags "-s -w" -o sms-relay .
 ```
 
 ---
 
 ## Command Line Usage
 
+Default (WebSocket mode) — no secret and no inbound path needed; it prints a Device ID
+and Encryption Key to pair in the OpenCARWINGS panel on first run:
+
 ```bash
-/cache/sms-relay -secret <YOUR_SECRET_TOKEN> [options]
+/cache/sms-relay [options]
+```
+
+Fallback (HTTP webhook mode) — requires a secret protecting the `/hook` endpoint:
+
+```bash
+/cache/sms-relay -mode http -secret <YOUR_SECRET_TOKEN> [options]
 # Or using environment variable:
-SMS_RELAY_SECRET=<YOUR_SECRET_TOKEN> /cache/sms-relay [options]
+SMS_RELAY_SECRET=<YOUR_SECRET_TOKEN> /cache/sms-relay -mode http [options]
 ```
 
 ### Options & Flags
@@ -113,6 +137,51 @@ SMS_RELAY_SECRET=<YOUR_SECRET_TOKEN> /cache/sms-relay [options]
 | `-reqlog` | `false` | Log incoming HTTP request headers and timing diagnostics to `reqlog.jsonl`. |
 | `-debug` | `false` | Verbose step-by-step markers and raw body dump in `debug.log`. |
 | `-selftest`| `0` | Run `N` self-test AT cycles, output thread metrics, and exit. |
+| `-allow-to` | `""` | Comma-separated recipient MSISDNs the relay may send to (empty = any). Applies to both modes; a compromised panel then cannot use the SIM to text anyone else. |
+| `-memlog` | `0` | Periodically log `VmRSS` and thread count (`0` = off) — for RAM budgeting on the modem. |
+
+---
+
+## WebSocket Mode & TLS Trust
+
+With `-mode ws`, the relay dials **out** to the OpenCARWINGS gateway and holds the
+connection open, so the modem needs no inbound path — no port forwarding, no
+tunnel, and carrier-grade NAT on the cellular side stops mattering.
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `-mode` | `ws` | `ws` (outbound OpenCARWINGS WebSocket client, default) or `http` (inbound webhook server, fallback). |
+| `-ws-url` | `wss://opencarwings.viaaq.eu/ws/smsgateway/` | Gateway WebSocket URL. |
+| `-ws-identity` | `<logdir>/ws-identity.json` | Device identity file (device ID + encryption key). Auto-generated on first run; paste the printed values into the panel to pair. |
+| `-ws-ping` | `30s` | Keepalive ping interval (`0` = disable). |
+| `-ws-ca` | `""` | PEM of **extra** root CAs, added to the embedded bundle. |
+
+On first run in `-mode ws` the relay prints the Device ID and Encryption Key to paste into the OpenCARWINGS panel, then keeps reconnecting on its own.
+
+For protocol debugging there are also `-ws-trace` (log every frame), `-ws-dump` (hex-dump frame bytes), `-ws-hello` (send a text frame after the handshake), and `-ws-connect-to` (dial a specific edge `host:port` while keeping the SNI/Host from `-ws-url`).
+
+Stock modem firmware ships no `/etc/ssl/certs`, so the binary carries its own
+minimal CA bundle (`ca/roots.pem`, embedded at build time). It contains the
+Google Trust Services and Let's Encrypt (ISRG) root families plus the GlobalSign
+cross-sign anchor — the issuers a Cloudflare-fronted endpoint rotates between — so
+TLS keeps validating across a rotation without a new binary.
+
+`-ws-ca` **adds** to that embedded set (and to the host's system roots, if any); it
+does not replace them. Use it to trust a different endpoint, or as an escape hatch
+if the endpoint's root ever rotates to one the bundle has not caught up with.
+
+The roots are public certificates (not secrets), documented with their sources and
+SHA-256 fingerprints in [`ca/README.md`](ca/README.md). CI keeps them honest: a
+**reproducibility** check re-runs `tools/mkca.sh` and fails if the committed bundle
+is not byte-identical to what the authoritative CA publishers serve, and a weekly
+**canary** TLS-dials the default endpoint against `ca/roots.pem` alone so a rotation
+surfaces before it reaches a device.
+
+To refresh the embedded bundle after a known root rotation:
+
+```bash
+sh tools/mkca.sh && git diff ca/roots.pem
+```
 
 ---
 

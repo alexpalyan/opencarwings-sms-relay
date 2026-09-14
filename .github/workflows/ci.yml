@@ -10,6 +10,16 @@ on:
 permissions:
   contents: read
 
+env:
+  # Match production exactly. The modem's kernel breaks stock crypto/rand, so we
+  # build with a patched standard library via `go build -overlay` (see
+  # toolchain/mkoverlay and toolchain_guard.go). GOTOOLCHAIN=local pins the Go
+  # provided by setup-go; the overlay's text anchors are tied to that version.
+  GOTOOLCHAIN: local
+  # -overlay patches the stdlib; -tags patchedstdlib disables the build guard that
+  # otherwise fails the build on Go >= 1.24 (which would die on the device).
+  PATCHFLAGS: -overlay=/tmp/ovl/overlay.json -tags patchedstdlib
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
@@ -19,7 +29,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version-file: 'go.mod'
+          go-version: '1.27.1'
 
       - name: Check Code Formatting (gofmt)
         run: |
@@ -29,14 +39,17 @@ jobs:
             exit 1
           fi
 
+      - name: Generate patched-stdlib overlay
+        run: go run ./toolchain/mkoverlay -out /tmp/ovl
+
       - name: Run Tests (Linux)
-        run: go test -v ./...
+        run: go test -v $PATCHFLAGS ./...
 
       - name: Run go vet
-        run: go vet ./...
+        run: go vet $PATCHFLAGS ./...
 
       - name: Cross-compile for ZTE Modem (ARMv5/ARMv7)
-        run: GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o sms-relay .
+        run: GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 go build $PATCHFLAGS -trimpath -ldflags "-s -w" -o sms-relay .
 
       - name: Package Archive & Checksums
         run: |
