@@ -1,0 +1,59 @@
+name: CA Bundle
+
+# Integrity of the embedded CA bundle (ca/roots.pem):
+#   - reproducible: prove the committed bundle is exactly what tools/mkca.sh
+#     produces from the authoritative CA publishers — nobody can hand-insert a
+#     rogue certificate without this going red.
+#   - canary: prove the live default endpoint still chains to a root in the
+#     bundle, so a CA rotation surfaces here before it reaches a device.
+
+on:
+  schedule:
+    # Mondays 06:00 UTC.
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+    paths:
+      - 'ca/roots.pem'
+      - 'tools/mkca.sh'
+      - '.github/workflows/ca.yml'
+  pull_request:
+    paths:
+      - 'ca/roots.pem'
+      - 'tools/mkca.sh'
+      - '.github/workflows/ca.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  reproducible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Rebuild bundle from source and verify it matches the committed file
+        run: |
+          sh tools/mkca.sh
+          if ! git diff --exit-code -- ca/roots.pem; then
+            echo "::error::ca/roots.pem does not match tools/mkca.sh output — regenerate with 'sh tools/mkca.sh' and commit, or investigate the source change."
+            exit 1
+          fi
+          echo "ca/roots.pem is reproducible from tools/mkca.sh"
+
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate live chain against embedded bundle only
+        run: |
+          host=opencarwings.viaaq.eu   # keep in sync with the -ws-url default in main.go
+          out=$(echo | openssl s_client -connect "$host:443" -servername "$host" \
+                  -CAfile ca/roots.pem 2>/dev/null)
+          echo "$out" | grep -E 'Verify return code'
+          if ! echo "$out" | grep -q 'Verify return code: 0 (ok)'; then
+            echo "::error::$host no longer validates against ca/roots.pem — a root likely rotated. Regenerate with tools/mkca.sh."
+            exit 1
+          fi

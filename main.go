@@ -16,13 +16,21 @@
 // Logging:
 // Logs to /cache/sms-relay-log/relay-YYYYMMDD.jsonl (ubifs partition, survives reboot).
 //
-// Cross-compilation for ZTE modem (ARMv7 32-bit / ARMv5 softfloat depending on target):
+// Cross-compilation for the ZTE modem (ARMv5 softfloat / ARMv7). The kernel breaks
+// stock crypto/rand, so build with the patched-stdlib overlay (see toolchain_guard.go):
 //
-//	GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o sms-relay .
+//	go run ./toolchain/mkoverlay -out /tmp/ovl
+//	GOOS=linux GOARCH=arm GOARM=5 CGO_ENABLED=0 \
+//	  go build -overlay=/tmp/ovl/overlay.json -tags patchedstdlib \
+//	  -trimpath -ldflags "-s -w" -o sms-relay .
 //
-// Usage on modem:
+// Usage on modem (default WebSocket mode — no inbound path; prints pairing info on first run):
 //
-//	/cache/sms-relay -secret <TOKEN> [-listen 192.168.0.1:8787] [-report]
+//	/cache/sms-relay
+//
+// HTTP webhook fallback (LAN-local or tunneled setups):
+//
+//	/cache/sms-relay -mode http -secret <TOKEN> [-listen 192.168.0.1:8787]
 package main
 
 import (
@@ -54,6 +62,18 @@ var (
 	debug    = flag.Bool("debug", false, "Verbose step-by-step markers + raw body dump in debug.log (contains full PDU with phone number!)")
 	logURL   = flag.Bool("logurl", false, "Expose GET /log/<secret> via HTTP (log contains phone number fragment) — default off, direct file access recommended")
 	selftest = flag.Int("selftest", 0, "Diagnostic mode: N cycles open->AT/AT+CSQ->close, display thread stats and exit (does NOT send SMS)")
+
+	mode     = flag.String("mode", "ws", "Frontend: ws (outbound OpenCARWINGS WebSocket client, needs no inbound path — default) | http (inbound webhook server, fallback for LAN/tunnel setups)")
+	wsURL    = flag.String("ws-url", "wss://opencarwings.viaaq.eu/ws/smsgateway/", "OpenCARWINGS SMS gateway WebSocket URL (-mode ws)")
+	wsIDFile = flag.String("ws-identity", "", "Device identity file for pairing (default <logdir>/ws-identity.json)")
+	wsCA     = flag.String("ws-ca", "", "PEM file of extra root CAs, added to the embedded bundle (for another endpoint, or a root rotation)")
+	wsPing   = flag.Duration("ws-ping", 30*time.Second, "WebSocket keepalive ping interval (0 = disable)")
+	allowTo  = flag.String("allow-to", "", "Comma-separated destination MSISDNs the relay may send to (empty = any). A compromised or hostile panel then cannot use this SIM to text anyone else.")
+	wsHello  = flag.String("ws-hello", "", "Text frame to send right after the handshake — diagnostics only, for probing servers that expect a client hello")
+	wsTrace  = flag.Bool("ws-trace", false, "Log every WebSocket frame (opcode and size) — protocol diagnostics")
+	wsConnTo = flag.String("ws-connect-to", "", "Dial this host:port instead of the one in -ws-url, keeping SNI and the Host header — for pinning a specific CDN edge address")
+	wsDump   = flag.Bool("ws-dump", false, "Hex-dump every frame's header, mask and payload — for comparing byte-for-byte what two hosts put on the wire")
+	memlog   = flag.Duration("memlog", 0, "Periodically report VmRSS and thread count (0 = off) — for RAM budgeting on the modem")
 
 	atMode   = flag.String("at", "auto", "AT transport mode: auto|atsrv|rpm30 (auto = atserver if running)")
 	atSock   = flag.String("atsock", "/tmp/zte_socket/AT_SERVER_MSG", "Unix socket path for atserver")
@@ -103,10 +123,6 @@ func main() {
 		runSelfTest(*selftest)
 		return
 	}
-	if *secret == "" {
-		fmt.Println("❌ -secret <TOKEN> or SMS_RELAY_SECRET environment variable is required (protects /hook endpoint)")
-		os.Exit(2)
-	}
 
 	// Note on OOM score adjustment:
 	// We intentionally do not lower oom_score_adj (e.g. -800). On ~55MB total system RAM,
@@ -115,6 +131,33 @@ func main() {
 	// A supervisor will restart this relay, whereas stock processes won't be recovered automatically.
 	if err := os.MkdirAll(*logDir, 0755); err != nil {
 		fmt.Printf("⚠️  logdir %s: %v\n", *logDir, err)
+	}
+	parseAllowList()
+	if *memlog > 0 {
+		go memlogLoop()
+	}
+	if *watchdog > 0 {
+		fmt.Printf("atserver watchdog: checking every %s\n", *watchdog)
+		go watchdogLoop()
+	}
+
+	switch *mode {
+	case "http":
+		runHTTP()
+	case "ws":
+		runWS()
+	default:
+		fmt.Printf("❌ unknown -mode %q (expected http or ws)\n", *mode)
+		os.Exit(2)
+	}
+}
+
+// runHTTP serves the inbound webhook. Requires something in front of it — a LAN-local
+// panel or a tunnel — because the cellular side is unreachable from the internet.
+func runHTTP() {
+	if *secret == "" {
+		fmt.Println("❌ -secret <TOKEN> or SMS_RELAY_SECRET environment variable is required (protects /hook endpoint)")
+		os.Exit(2)
 	}
 
 	ln, err := net.Listen("tcp", *listen)
@@ -126,10 +169,6 @@ func main() {
 	fmt.Printf("device %s  report(+CDS)=%v  cooldown=%s  logdir=%s\n", *dev, *report, *cooldown, *logDir)
 	fmt.Printf("transport: at=%s → currently %q (atserver pid=%d, socket %s)\n",
 		*atMode, pickTransport(), atServerPID(), *atSock)
-	if *watchdog > 0 {
-		fmt.Printf("atserver watchdog: checking every %s\n", *watchdog)
-		go watchdogLoop()
-	}
 	var tempDelay time.Duration
 	for {
 		c, err := ln.Accept()
@@ -261,17 +300,35 @@ func oneLine(s string) string {
 	return strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\r", " "), "\n", " "))
 }
 
-func procThreads() string {
+func procThreads() string { return procStatusField("Threads:") }
+
+// procRSS reports resident set size, so the modem's memory budget can be checked
+// without extra tooling on the device.
+func procRSS() string { return procStatusField("VmRSS:") }
+
+func procStatusField(prefix string) string {
 	b, err := os.ReadFile("/proc/self/status")
 	if err != nil {
 		return "?"
 	}
 	for _, l := range strings.Split(string(b), "\n") {
-		if strings.HasPrefix(l, "Threads:") {
-			return strings.TrimSpace(strings.TrimPrefix(l, "Threads:"))
+		if strings.HasPrefix(l, prefix) {
+			return strings.Join(strings.Fields(strings.TrimPrefix(l, prefix)), " ")
 		}
 	}
 	return "?"
+}
+
+func memlogLoop() {
+	for {
+		time.Sleep(*memlog)
+		rss, peak, threads := procRSS(), procStatusField("VmHWM:"), procThreads()
+		fmt.Printf("%s mem: rss=%s peak=%s threads=%s\n", time.Now().Format("15:04:05"), rss, peak, threads)
+		logJSON(map[string]any{
+			"ts": time.Now().UTC().Format(time.RFC3339), "result": "memstat",
+			"rss": rss, "peak_rss": peak, "threads": threads,
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -446,20 +503,23 @@ func handleHook(req *request) string {
 		if tpduLen == 0 {
 			tpduLen = info.atLength
 		}
-		stateMu.Lock()
 		if *reqlog {
+			stateMu.Lock()
 			logPDUDiff(body.PDU, lastPDU, info, time.Since(lastSent))
+			stateMu.Unlock()
 		}
-		dup := body.PDU == lastPDU && time.Since(lastSent) < *cooldown
-		if dup {
-			result = "cooldown-dup"
-		} else {
-			lastPDU = body.PDU
-			lastSent = time.Now()
-			result = "queued"
+		if !destinationAllowed(phone) {
+			result = "dest-refused"
+			logJSON(map[string]any{
+				"ts": ts.Format(time.RFC3339), "peer": req.peer,
+				"result": "dest-refused", "phone": redact(phone),
+			})
+			fmt.Printf("%s ⛔ refused: %s is not in -allow-to\n", ts.Format("15:04:05"), redact(phone))
+			return "200 OK"
 		}
-		stateMu.Unlock()
-		if !dup {
+		sending := claimPDU(body.PDU)
+		result = ifStr(sending, "queued", "cooldown-dup")
+		if sending {
 			rec := map[string]any{
 				"ts": ts.Format(time.RFC3339), "peer": req.peer,
 				"phone": redact(phone), "dcs": info.dcs, "tpdu_len": tpduLen, "type": body.Type,
@@ -475,6 +535,59 @@ func handleHook(req *request) string {
 	fmt.Printf("%s %s peer=%s -> %s%s\n", ts.Format("15:04:05"), req.method, req.peer, result,
 		ifStr(phone != "", " → "+redact(phone), ""))
 	return "200 OK"
+}
+
+// allowedDest holds the parsed -allow-to list; empty means "no restriction".
+var allowedDest []string
+
+func parseAllowList() {
+	for _, e := range strings.Split(*allowTo, ",") {
+		if n := normalizeMSISDN(e); n != "" {
+			allowedDest = append(allowedDest, n)
+		}
+	}
+	if len(allowedDest) > 0 {
+		fmt.Printf("destination allowlist: %d number(s) — everything else is refused\n", len(allowedDest))
+	}
+}
+
+func normalizeMSISDN(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteByte(byte(r))
+		}
+	}
+	return b.String()
+}
+
+// destinationAllowed gates every PDU on its decoded recipient. The panel builds the PDU,
+// so without this the relay would text whatever number it is handed — turning the SIM into
+// a remote-controlled sender if the panel is ever compromised.
+func destinationAllowed(phone string) bool {
+	if len(allowedDest) == 0 {
+		return true
+	}
+	p := normalizeMSISDN(phone)
+	for _, a := range allowedDest {
+		if a == p {
+			return true
+		}
+	}
+	return false
+}
+
+// claimPDU reserves a PDU for sending, or reports false when the identical PDU is still
+// inside the cooldown window. Shared by both frontends so a panel that retries over one
+// transport cannot bypass deduplication on the other.
+func claimPDU(pduHex string) bool {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if pduHex == lastPDU && time.Since(lastSent) < *cooldown {
+		return false
+	}
+	lastPDU, lastSent = pduHex, time.Now()
+	return true
 }
 
 func sendWorker(pduHex string, tpduLen int, base map[string]any) {
